@@ -238,15 +238,27 @@ func (c *Cluster) getRandomPoolInner() (string, *pool.Pool) {
 // the same time and it will only actually occur once (subsequent clients will
 // have nil returned immediately).
 func (c *Cluster) Reset() error {
+	addr, p := c.getRandomPoolInner()
+	if p == nil {
+		return fmt.Errorf("no available nodes to Reset")
+	}
+
 	respCh := make(chan error)
 	c.callCh <- func(c *Cluster) {
-		respCh <- c.resetInner()
+		respCh <- c.resetInnerByAddr(addr)
 	}
 	return <-respCh
 }
 
-func (c *Cluster) resetInner() error {
+func (c *Cluster) ResetByAddr(addr string) error {
+	respCh := make(chan error)
+	c.callCh <- func(c *Cluster) {
+		respCh <- c.resetInnerByAddr(addr)
+	}
+	return <-respCh
+}
 
+func (c *Cluster) resetInnerByAddr(addr string) error {
 	// Throttle resetting so a bunch of routines can call Reset at once and the
 	// server won't be spammed. We don't a throttle until the second Reset is
 	// called, so the initial call inside New goes through correctly
@@ -260,9 +272,14 @@ func (c *Cluster) resetInner() error {
 		c.resetThrottle = time.NewTicker(c.o.ResetThrottle)
 	}
 
-	addr, p := c.getRandomPoolInner()
-	if p == nil {
-		return fmt.Errorf("no available nodes to call CLUSTER SLOTS on")
+	p, ok := c.pools[addr]
+	if ok == false {
+		var err error
+		p, err = newPool(addr, c.o.Timeout, c.o.PoolSize)
+		if err != nil {
+			return fmt.Errorf("no available node to call CLUSTER SLOTS on")
+		}
+		c.pools[addr] = p
 	}
 
 	client, err := p.Get()
@@ -285,7 +302,6 @@ func (c *Cluster) resetInner() error {
 	var start, end, port int
 	var ip, slotAddr string
 	var slotPool *pool.Pool
-	var ok bool
 	for _, slotGroup := range r.Elems {
 		if start, err = slotGroup.Elems[0].Int(); err != nil {
 			return err
@@ -482,10 +498,21 @@ func (c *Cluster) clientCmd(
 			}
 		}
 
-		addr, client, getErr := c.getConn("", addr)
-		if getErr != nil {
-			return errorReply(getErr)
+		// We shall send cmd to addr
+		// if can't get the conn to addr try ResetByAddr
+		getAddr, client, getErr := c.getConn("", addr)
+		if getAddr != addr {
+			if resetErr := c.ResetByAddr(addr); resetErr != nil {
+				return errorReplyf("Could not get cluster info: %s", resetErr)
+			}
+			getAddr, client, getErr = c.getConn("", addr)
+			if getErr != nil {
+				return errorReply(getErr)
+			}
+			// if still can't get conn to addr will try a random node
+			return c.clientCmd(addr, client, cmd, args, ask && getAddr == addr, tried, true)
 		}
+
 		return c.clientCmd(addr, client, cmd, args, ask, tried, haveReset)
 	}
 
